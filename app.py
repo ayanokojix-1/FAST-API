@@ -28,7 +28,6 @@ app.state.limiter = limiter
 # ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
-    SlowAPIMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://localhost:3000"
