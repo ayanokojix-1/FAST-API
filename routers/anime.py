@@ -267,77 +267,92 @@ async def bulk_download_zip(request: Request):
     
     print(f"🔍 Starting ZIP creation for {len(links)} episodes")
     
-    async def generate_zip():
-        """Stream ZIP file chunk by chunk"""
-        
-        # Create ZIP in memory
-        zip_buffer = io.BytesIO()
-        
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
-                for link_info in links:
-                    episode = link_info.get("episode")
-                    url = link_info.get("direct_link")
+    # Browser-like headers to bypass blocking
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate',
+        'Referer': 'https://kwik.cx/',
+        'Origin': 'https://kwik.cx',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+    }
+    
+    # Create ZIP in memory FIRST (not in generator)
+    zip_buffer = io.BytesIO()
+    
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True, headers=headers) as client:
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
+            for link_info in links:
+                episode = link_info.get("episode")
+                url = link_info.get("direct_link")
+                
+                if not url:
+                    print(f"⚠️ Skipping episode {episode}: No URL")
+                    continue
+                
+                filename = f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
+                
+                print(f"📥 Downloading episode {episode}...")
+                
+                try:
+                    # Download episode with proper headers
+                    response = await client.get(url, timeout=300)
                     
-                    if not url:
-                        print(f"⚠️ Skipping episode {episode}: No URL")
-                        continue
+                    print(f"📊 Episode {episode}: Status {response.status_code}, Size: {len(response.content)} bytes")
                     
-                    filename = f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
-                    
-                    print(f"📥 Downloading episode {episode}...")
-                    
-                    try:
-                        # Download episode
-                        response = await client.get(url, timeout=300)
+                    # Check if actually got video (not 403 error page)
+                    if response.status_code == 200 and len(response.content) > 100000:  # At least 100KB
+                        # Write to ZIP
+                        zip_file.writestr(filename, response.content)
+                        print(f"✅ Episode {episode} added to ZIP ({len(response.content)} bytes)")
+                    else:
+                        print(f"❌ Episode {episode} failed: Status {response.status_code}, Size: {len(response.content)} bytes")
                         
-                        print(f"📊 Episode {episode}: Status {response.status_code}, Size: {len(response.content)} bytes")
-                        
-                        if response.status_code == 200 and len(response.content) > 0:
-                            # Write to ZIP
-                            zip_file.writestr(filename, response.content)
-                            print(f"✅ Episode {episode} added to ZIP ({len(response.content)} bytes)")
-                        else:
-                            print(f"❌ Episode {episode} failed: HTTP {response.status_code}, Size: {len(response.content)}")
-                            
-                    except httpx.TimeoutException:
-                        print(f"❌ Episode {episode} timed out")
-                    except Exception as e:
-                        print(f"❌ Episode {episode} error: {str(e)}")
-                        continue
-        
-        print(f"✅ ZIP creation complete! Total size: {zip_buffer.tell()} bytes")
-        
-        # Get ZIP content
-        zip_buffer.seek(0)
-        zip_content = zip_buffer.read()
-        
-        if len(zip_content) == 0:
-            print("⚠️ WARNING: ZIP file is empty!")
-        
-        # Stream in chunks
+                except httpx.TimeoutException:
+                    print(f"❌ Episode {episode} timed out")
+                except Exception as e:
+                    print(f"❌ Episode {episode} error: {str(e)}")
+                    continue
+    
+    # Get final ZIP size
+    zip_size = zip_buffer.tell()
+    print(f"✅ ZIP creation complete! Total size: {zip_size} bytes ({zip_size / (1024*1024):.2f} MB)")
+    
+    # Check if ZIP is suspiciously small (all downloads failed)
+    if zip_size < 1000:
+        print("⚠️ WARNING: ZIP file is too small - all downloads likely failed!")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": 500,
+                "message": "Failed to download episodes - source may be blocking requests"
+            }
+        )
+    
+    # Stream the completed ZIP
+    zip_buffer.seek(0)
+    
+    def iterate_file():
+        """Generator to stream the completed ZIP"""
         chunk_size = 64 * 1024  # 64KB chunks
-        for i in range(0, len(zip_content), chunk_size):
-            yield zip_content[i:i + chunk_size]
+        while True:
+            chunk = zip_buffer.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
     
     filename = f"{anime_title}_Episodes.zip"
     
-    # Calculate total size estimate
-    total_size = 0
-    for link in links:
-        size_str = link.get("size", "0 MB")
-        try:
-            size_value = float(size_str.split()[0])
-            total_size += int(size_value * 1024 * 1024)
-        except:
-            pass
-    
     return StreamingResponse(
-        generate_zip(),
+        iterate_file(),
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Content-Type": "application/zip",
-            "Content-Length": str(int(total_size * 0.95)) if total_size > 0 else ""
+            "Content-Length": str(zip_size)  # Use actual size
         }
     )
