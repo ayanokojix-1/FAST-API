@@ -1,5 +1,8 @@
-import zipfile
+#Ok, bro i have a question or rather, an issue.. The snapshots return an error 403 because they're linked to the domain that requires animepahe cookies to continue.. so we get an error 403 and the images don't display.. Even in the search the images don't display they all have error 403 but when i add cookies? they work.. so me rn i don't know what to do.. I'm not saying u should send me code but just idk enlghten me on what to do ig?
+import uuid
+import json
 import io
+import zipfile
 import asyncio
 from fastapi import APIRouter, Query, Depends,Request
 from fastapi.responses import JSONResponse,StreamingResponse
@@ -135,10 +138,11 @@ async def anime_download(id:str = Query(...,description="id for the anime from s
 
 
     return JSONResponse(status_code=500 if results.get("status") == 500 else 200,content=results)
+
 @router.get("/bulk-download", description="Bulk download multiple anime episodes", summary="Bulk download anime episodes")
 async def anime_bulk_download(
     id: str = Query(..., description="ID for the anime from search", example="OP3526"),
-    ep_from: int = Query(...,alias="from",description="Starting episode number", example=1, ge=1),
+    ep_from: int = Query(..., alias="from", description="Starting episode number", example=1, ge=1),
     ep_to: int = Query(..., alias="to", description="Ending episode number", example=24, ge=1),
     db = Depends(get_db)
 ):
@@ -191,8 +195,20 @@ async def anime_bulk_download(
             "message": "Failed to fetch any episode links"
         })
     
+    # CREATE SESSION - Store links in DB
+    session_id = str(uuid.uuid4())
+    
+    await db.execute(
+        "INSERT INTO download_sessions (session_id, anime_id, anime_title, links, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+        (session_id, id, info.get("title", "Unknown"), json.dumps(successful_links))
+    )
+    await db.commit()
+    
+    print(f"✅ Created session {session_id} for {info.get('title')}")
+    
     return JSONResponse(status_code=200, content={
         "status": 200,
+        "session_id": session_id,  # NEW: Return session ID
         "anime_title": info.get("title", "Unknown"),
         "total_requested": len(episodes),
         "total_fetched": len(successful_links),
@@ -221,6 +237,7 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
                     "episode": row["episode"],
                     "direct_link": row["video_url"],
                     "size": row["size"],
+                    "snapshot": row["snapshot"],
                     "status": 200
                 }
         
@@ -230,6 +247,7 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
         episode_info = search_result[episode - 1]
         episode_session = episode_info.get("session")
         episode_snapshot = episode_info.get("snapshot")
+        
         pahe_link = await get_pahewin_link(external_id, episode_session)
         if not pahe_link:
             print(f"❌ Episode {episode}: No pahe link found")
@@ -240,7 +258,7 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
             print(f"❌ Episode {episode}: No kiwi URL found")
             return None
         
-        results = await get_redirect_link(kiwi_url, id, episode, db,episode_snapshot)
+        results = await get_redirect_link(kiwi_url, id, episode, db, episode_snapshot)
         
         if results and results.get("status") == 200:
             print(f"✅ Episode {episode}: Successfully fetched")
@@ -253,106 +271,130 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
         print(f"❌ Episode {episode}: Error - {e}")
         return None
 
+import os
+import tempfile
+import shutil
 
-
-
-@router.post("/bulk-download-zip")
-async def bulk_download_zip(request: Request):
-    body = await request.json()
-    links: List[Dict] = body.get("links", [])
-    anime_title: str = body.get("anime_title", "Anime").replace(" ", "_")
+@router.get("/bulk-download-zip")
+async def bulk_download_zip_get(
+    session_id: str = Query(..., description="Download session ID"),
+    db = Depends(get_db)
+):
+    """
+    Download episodes to disk, ZIP them, stream, then delete
+    Uses 2x bandwidth but WORKS every time!
+    """
     
-    if not links:
-        return {"status": 400, "message": "No links provided"}
+    print(f"🔍 Fetching session {session_id}")
     
-    print(f"🔍 Starting ZIP creation for {len(links)} episodes")
+    # Get session
+    cursor = await db.execute(
+        "SELECT * FROM download_sessions WHERE session_id = ?",
+        (session_id,)
+    )
+    row = await cursor.fetchone()
     
-    # Browser-like headers to bypass blocking
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate',
-        'Referer': 'https://kwik.cx/',
-        'Origin': 'https://kwik.cx',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-    }
+    if not row:
+        return JSONResponse(status_code=404, content={"status": 404, "message": "Session not found"})
     
-    # Create ZIP in memory FIRST (not in generator)
-    zip_buffer = io.BytesIO()
+    links = json.loads(row["links"])
+    anime_title = row["anime_title"].replace(" ", "_")
     
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True, headers=headers) as client:
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
+    print(f"🔍 Creating ZIP for {anime_title} with {len(links)} episodes")
+    
+    # Create temporary directory
+    temp_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(temp_dir, f"{anime_title}_Episodes.zip")
+    
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://kwik.cx/',
+        }
+        
+        # Step 1: Download all episodes to disk
+        downloaded_files = []
+        
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True, headers=headers) as client:
             for link_info in links:
                 episode = link_info.get("episode")
                 url = link_info.get("direct_link")
                 
                 if not url:
-                    print(f"⚠️ Skipping episode {episode}: No URL")
                     continue
                 
                 filename = f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
+                filepath = os.path.join(temp_dir, filename)
                 
-                print(f"📥 Downloading episode {episode}...")
+                print(f"📥 Downloading episode {episode} to disk...")
                 
                 try:
-                    # Download episode with proper headers
                     response = await client.get(url, timeout=300)
                     
-                    print(f"📊 Episode {episode}: Status {response.status_code}, Size: {len(response.content)} bytes")
-                    
-                    # Check if actually got video (not 403 error page)
-                    if response.status_code == 200 and len(response.content) > 100000:  # At least 100KB
-                        # Write to ZIP
-                        zip_file.writestr(filename, response.content)
-                        print(f"✅ Episode {episode} added to ZIP ({len(response.content)} bytes)")
-                    else:
-                        print(f"❌ Episode {episode} failed: Status {response.status_code}, Size: {len(response.content)} bytes")
+                    if response.status_code == 200 and len(response.content) > 100000:
+                        # Save to disk
+                        with open(filepath, 'wb') as f:
+                            f.write(response.content)
                         
-                except httpx.TimeoutException:
-                    print(f"❌ Episode {episode} timed out")
+                        downloaded_files.append(filepath)
+                        print(f"✅ Episode {episode} saved to disk")
+                    else:
+                        print(f"❌ Episode {episode} failed: {response.status_code}")
+                
                 except Exception as e:
-                    print(f"❌ Episode {episode} error: {str(e)}")
+                    print(f"❌ Episode {episode} error: {e}")
                     continue
-    
-    # Get final ZIP size
-    zip_size = zip_buffer.tell()
-    print(f"✅ ZIP creation complete! Total size: {zip_size} bytes ({zip_size / (1024*1024):.2f} MB)")
-    
-    # Check if ZIP is suspiciously small (all downloads failed)
-    if zip_size < 1000:
-        print("⚠️ WARNING: ZIP file is too small - all downloads likely failed!")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": 500,
-                "message": "Failed to download episodes - source may be blocking requests"
+        
+        if not downloaded_files:
+            return JSONResponse(status_code=500, content={"status": 500, "message": "No episodes downloaded"})
+        
+        # Step 2: Create ZIP from downloaded files
+        print(f"📦 Creating ZIP file...")
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zip_file:
+            for filepath in downloaded_files:
+                zip_file.write(filepath, os.path.basename(filepath))
+                print(f"✅ Added {os.path.basename(filepath)} to ZIP")
+        
+        zip_size = os.path.getsize(zip_path)
+        print(f"✅ ZIP created! Size: {zip_size / (1024*1024):.2f} MB")
+        
+        # Step 3: Stream the ZIP file
+        def iterate_file():
+            with open(zip_path, 'rb') as f:
+                chunk_size = 64 * 1024
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        
+        # Delete session
+        await db.execute("DELETE FROM download_sessions WHERE session_id = ?", (session_id,))
+        await db.commit()
+        
+        # Return streaming response
+        response = StreamingResponse(
+            iterate_file(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{anime_title}_Episodes.zip"',
+                "Content-Length": str(zip_size)  # Exact size!
             }
         )
+        
+        # Schedule cleanup after response is sent
+        async def cleanup():
+            await asyncio.sleep(5)  # Wait for download to start
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print(f"🗑️ Cleaned up temp directory")
+        
+        asyncio.create_task(cleanup())
+        
+        return response
     
-    # Stream the completed ZIP
-    zip_buffer.seek(0)
-    
-    def iterate_file():
-        """Generator to stream the completed ZIP"""
-        chunk_size = 64 * 1024  # 64KB chunks
-        while True:
-            chunk = zip_buffer.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk
-    
-    filename = f"{anime_title}_Episodes.zip"
-    
-    return StreamingResponse(
-        iterate_file(),
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Type": "application/zip",
-            "Content-Length": str(zip_size)  # Use actual size
-        }
-    )
+    except Exception as e:
+        # Cleanup on error
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        print(f"❌ Error: {e}")
+        return JSONResponse(status_code=500, content={"status": 500, "message": str(e)})

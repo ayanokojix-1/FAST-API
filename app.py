@@ -97,6 +97,15 @@ async def startup():
                 UNIQUE(internal_id, episode)
             )
         """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS download_sessions (
+    session_id TEXT PRIMARY KEY,
+    anime_id TEXT NOT NULL,
+    anime_title TEXT NOT NULL,
+    links TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);      
+        """)
 
         await db.commit()
 

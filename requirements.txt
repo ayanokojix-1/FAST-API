@@ -7,4 +7,3 @@ python-dotenv
 httpx
 beautifulsoup4
 playwright
-zipstream-new
