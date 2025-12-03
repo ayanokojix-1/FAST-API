@@ -168,7 +168,13 @@ async def get_episode_session(id, db):
             return None
 
         await db.execute(
-            "INSERT INTO anime_episode(episode, external_id, page_count) VALUES (?, ?, ?)",
+           """
+    INSERT INTO anime_episode(internal_id, external_id, title, episode_number)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(external_id) DO UPDATE SET
+        title = excluded.title,
+        episode_number = excluded.episode_number
+    """,
             (data.get("total"), id, data.get("last_page"))
         )
         await db.commit()

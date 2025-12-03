@@ -41,9 +41,16 @@ async def anime_search(query: str = Query(..., description="Anime name for the s
             row = await cursor.fetchone()
             episodes = await get_actual_episode(i.get("session")) if i.get(
                 "episodes") == 0 or i.get("status") == "Currently Airing" else i.get("episodes")
-            if not row or not row["internal_id"]:
+            if not row:
                 internal_id = await generate_internal_id(i.get("title"))
-                await db.execute("INSERT INTO anime_info(internal_id,external_id,title,episodes) VALUES(?,?,?,?)",
+                await db.execute('''
+                INSERT INTO anime_info(internal_id, external_id, title, episodes)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(external_id) DO UPDATE SET
+    title = excluded.title,
+    episodes = excluded.episodes;
+
+                ''',
                         (internal_id, i.get("session"), i.get("title"), episodes))
                 await db.commit()
             else:
