@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI,Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import aiosqlite
@@ -10,6 +10,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from routers.tiktok import router as tiktok_router
 from routers.file import file_router
+from db import get_db
 from routers.anime import router as anime_router
 from helpers.anime_helper import get_animepahe_cookies
 
@@ -124,7 +125,8 @@ async def startup():
     summary="API Root",
     description="Welcome message and available information about the API.",
 )
-async def root():
+async def root(db= Depends(get_db)):
+    await get_animepahe_cookies(db)
     return {
         "message": "Welcome to the FAST-API Service 🚀",
         "version": "1.0.0",
